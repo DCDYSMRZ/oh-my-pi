@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- Kept steering message wrappers and date/cwd reminders stable across provider requests, while recovering the current reminder after side requests or history trimming and honoring message edits (by [@DCDYSMRZ](https://github.com/DCDYSMRZ)).
+- Kept the Goal capability declared across goal lifecycle transitions; disabling it pauses execution, and Goal entry points respect the session's selected tools and active modes (by [@DCDYSMRZ](https://github.com/DCDYSMRZ)).
 - Replying `c` during a `/guided-goal` interview now sends `c` as your answer instead of triggering the continue shortcut ([#13819](https://github.com/can1357/oh-my-pi/pull/13819) by [@H4vC](https://github.com/H4vC))
 - Cache-warming refreshes cancelled or superseded after the provider accepted them now count toward session usage and cost instead of being dropped ([#13717](https://github.com/can1357/oh-my-pi/pull/13717))
 - `omp plugin upgrade <name>` now upgrades npm- and git-installed plugins (e.g. `ida-mcp` installed from `github:HexRaysSA/ida-mcp#latest`, which `hcli mcp install` relies on) and resolves a bare marketplace plugin name, instead of failing with "Invalid plugin ID"; the plugin's enabled state and feature selection are kept ([#13812](https://github.com/can1357/oh-my-pi/pull/13812) by [@H4vC](https://github.com/H4vC))

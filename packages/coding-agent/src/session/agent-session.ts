@@ -472,7 +472,7 @@ import {
 	cfgExtendedContext,
 	cfgWorkspaceAdditionalDirectories,
 } from "./context-settings";
-import { cfgTitleRefreshOnReplan } from "../goals/settings";
+import { cfgGoalEnabled, cfgTitleRefreshOnReplan } from "../goals/settings";
 import {
 	cfgComputerEnabled,
 	cfgRatchetEnabled,
@@ -1962,6 +1962,7 @@ export class AgentSession implements SettingsScope {
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
 		this.#goalRuntime = new GoalRuntime({
+			getExecutionBlocker: () => this.getGoalExecutionBlocker(),
 			getState: () => this.#goalModeState,
 			setState: state => {
 				this.#goalModeState = state;
@@ -5922,8 +5923,27 @@ export class AgentSession implements SettingsScope {
 	 * SDK runs it whenever a gating setting changes; other runtime owners may call it
 	 * after changing an input the gate reads.
 	 */
-	reconcileBuiltinTools(options?: { refreshPrompt?: boolean }): Promise<void> {
-		return this.#tools.reconcileBuiltinTools(options);
+	async reconcileBuiltinTools(options?: { refreshPrompt?: boolean }): Promise<void> {
+		// Stop accounting and notify continuation consumers before retracting the tool.
+		if (!cfgGoalEnabled.get(this.settings)) {
+			if (this.#goalModeState?.enabled) await this.#goalRuntime.pauseGoal();
+			// Keep delivered history intact; only withdraw unconsumed Goal work.
+			const keep = (message: AgentMessage): boolean =>
+				message.role !== "custom" ||
+				(message.customType !== "goal-continuation" &&
+					message.customType !== "goal-mode-context" &&
+					message.customType !== "goal-budget-limit");
+			const steering = this.agent.peekSteeringQueue();
+			const followUp = this.agent.peekFollowUpQueue();
+			const filteredSteering = steering.filter(keep);
+			const filteredFollowUp = followUp.filter(keep);
+			if (filteredSteering.length !== steering.length || filteredFollowUp.length !== followUp.length) {
+				this.agent.replaceQueues(filteredSteering, filteredFollowUp);
+				this.#reconcileQueuedMessageDrain();
+			}
+			this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(keep);
+		}
+		await this.#tools.reconcileBuiltinTools(options);
 	}
 
 	/** Updates source provenance when a live registry entry is replaced or restored. */
@@ -6357,6 +6377,24 @@ export class AgentSession implements SettingsScope {
 			// does not inherit a stale `required` tool choice.
 			this.#toolChoiceQueue.removeByLabel("plan-mode-decision");
 		}
+	}
+
+	/** Whether Goal can execute with the current session's modes and granted tools. */
+	getGoalExecutionBlocker(): string | undefined {
+		if (!cfgGoalEnabled.get(this.settings)) {
+			return "Goal mode is disabled. Enable it in settings (goal.enabled).";
+		}
+		const mode = this.sessionManager.getBranch().findLast(entry => entry.type === "mode_change")?.mode;
+		if (this.#planModeState?.enabled || mode === "plan" || mode === "plan_paused") {
+			return "Exit plan mode first.";
+		}
+		if (this.#vibeModeState?.enabled || mode === "vibe") return "Exit vibe mode first.";
+		// Enabled names include Code Mode bridge tools and xd:// mounts, not just
+		// the provider's top-level declarations. Never widen an explicit selection.
+		if (!this.getEnabledToolNames().includes("goal")) {
+			return "Goal tool is not enabled. Explicitly enable the goal tool before starting or resuming a goal.";
+		}
+		return undefined;
 	}
 
 	getGoalModeState(): GoalModeState | undefined {
@@ -9117,6 +9155,9 @@ export class AgentSession implements SettingsScope {
 
 			this.#clearSessionScopedToolState();
 			this.#clearCheckpointRuntimeState();
+			this.#goalModeState = undefined;
+			this.#goalRuntime.clearAccounting();
+			await this.#emitSessionEvent({ type: "goal_updated", goal: null, state: undefined });
 			this.setTodoPhases([]);
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();

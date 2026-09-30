@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import type { Api, Context, Message, Model, ModelSpec } from "@oh-my-pi/pi-ai";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
+import type { Api, Context, Message, Model, ModelSpec, UserMessage } from "@oh-my-pi/pi-ai";
 import { clearCustomApis, registerCustomApi } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -8,10 +10,12 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { DateCwdReminderInjector, renderDateCwdReminder } from "@oh-my-pi/pi-coding-agent/session/date-cwd-reminder";
+import { convertToLlm, stripImagesFromMessage, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { formatLocalCalendarDate } from "@oh-my-pi/pi-tui/chrome/local-date";
 import { normalizePromptPath } from "@oh-my-pi/pi-coding-agent/utils/prompt-path";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 describe("date-cwd-reminder", () => {
@@ -106,6 +110,173 @@ describe("date-cwd-reminder", () => {
 
 			expect(replay.messages[0]).toBe(first.messages[0]);
 		});
+	});
+});
+
+function steeringMessage(kind: "user" | "collab", content: UserMessage["content"], timestamp = 1) {
+	return kind === "user"
+		? { role: "user" as const, content, steering: true, timestamp }
+		: {
+				role: "custom" as const,
+				customType: COLLAB_PROMPT_MESSAGE_TYPE,
+				content,
+				display: true,
+				attribution: "user" as const,
+				timestamp,
+			};
+}
+
+function steeringRequest(
+	injector: DateCwdReminderInjector,
+	messages: AgentMessage[],
+	date: string,
+	cwd: string,
+): Message[] {
+	return injector.transform(
+		{ systemPrompt: ["system"], messages: convertToLlm(wrapSteeringForModel(messages)) },
+		date,
+		cwd,
+	).messages;
+}
+
+function reminderText(message: Message): string {
+	if (typeof message.content === "string") return message.content;
+	const text: string[] = [];
+	for (const part of message.content) {
+		if (part.type === "text" && "text" in part && typeof part.text === "string") text.push(part.text);
+	}
+	return text.join("\n");
+}
+
+describe("steering date/cwd cache stability", () => {
+	for (const kind of ["user", "collab"] as const) {
+		describe(kind, () => {
+			it("preserves historical bytes across new turns, date/cwd changes, and A-B-A replay", () => {
+				const injector = new DateCwdReminderInjector();
+				const root = steeringMessage(kind, "first steer");
+				const history: AgentMessage[] = [root];
+				const first = steeringRequest(injector, history, "2026-08-14", "/old");
+				const firstBytes = JSON.stringify(first);
+				expect(reminderText(first[0]!)).toContain(renderDateCwdReminder("2026-08-14", "/old"));
+				expect(steeringRequest(injector, history, "2026-08-14", "/old")[0]).toBe(first[0]);
+
+				history.push(createAssistantMessage("done"), steeringMessage(kind, "same-day steer", 2));
+				const sameDay = steeringRequest(injector, history, "2026-08-14", "/old");
+				expect(sameDay[0]).toBe(first[0]);
+				expect(reminderText(sameDay[2]!)).not.toContain("<system-reminder>");
+				const sameDayBytes = JSON.stringify(sameDay);
+
+				history.push(steeringMessage(kind, "next-day steer", 3));
+				const nextDay = steeringRequest(injector, history, "2026-08-15", "/new");
+				expect(JSON.stringify(nextDay.slice(0, 3))).toBe(sameDayBytes);
+				expect(reminderText(nextDay[3]!)).toContain(renderDateCwdReminder("2026-08-15", "/new"));
+				const nextDayBytes = JSON.stringify(nextDay);
+
+				const cwdChange = steeringRequest(injector, history, "2026-08-15", "/elsewhere");
+				expect(JSON.stringify(cwdChange.slice(0, 4))).toBe(nextDayBytes);
+				expect(cwdChange[4]).toMatchObject({
+					role: "developer",
+					content: renderDateCwdReminder("2026-08-15", "/elsewhere"),
+				});
+				const back = steeringRequest(injector, history, "2026-08-14", "/old");
+				expect(back.slice(0, 5)).toEqual(cwdChange);
+				expect(back[5]).toMatchObject({ role: "developer", content: renderDateCwdReminder("2026-08-14", "/old") });
+				expect(JSON.stringify(back.slice(0, 1))).toBe(firstBytes);
+				expect(steeringRequest(injector, history, "2026-08-14", "/old")).toEqual(back);
+				expect(root.content).toBe("first steer");
+			});
+
+			it("refreshes owner edits and image removal on first and later reminder carriers", () => {
+				const injector = new DateCwdReminderInjector();
+				const text = { type: "text" as const, text: "first steer" };
+				const image = { type: "image" as const, data: "aW1n", mimeType: "image/png" };
+				const root = steeringMessage(kind, [text, image]);
+				const history: AgentMessage[] = [root];
+				steeringRequest(injector, history, "2026-08-14", "/old");
+				text.text = "edited first steer";
+				invalidateMessageCache(root);
+				const editedRoot = steeringRequest(injector, history, "2026-08-14", "/old");
+				expect(reminderText(editedRoot[0]!)).toContain("edited first steer");
+				expect(reminderText(editedRoot[0]!)).toContain(renderDateCwdReminder("2026-08-14", "/old"));
+				expect(editedRoot[0]!.content).toContainEqual(image);
+				expect(stripImagesFromMessage(root)).toBe(1);
+				const strippedRoot = steeringRequest(injector, history, "2026-08-14", "/old");
+				expect(strippedRoot[0]!.content).not.toContainEqual(image);
+				expect(reminderText(strippedRoot[0]!)).toContain("edited first steer");
+				expect(reminderText(strippedRoot[0]!)).toContain(renderDateCwdReminder("2026-08-14", "/old"));
+				const rootBytes = JSON.stringify(strippedRoot);
+
+				const later = steeringMessage(kind, "later steer", 2);
+				history.push(later);
+				steeringRequest(injector, history, "2026-08-15", "/new");
+				later.content = "edited later steer";
+				invalidateMessageCache(later);
+				const editedLater = steeringRequest(injector, history, "2026-08-15", "/new");
+				expect(JSON.stringify(editedLater.slice(0, 1))).toBe(rootBytes);
+				expect(reminderText(editedLater[1]!)).toContain("edited later steer");
+				expect(reminderText(editedLater[1]!)).toContain(renderDateCwdReminder("2026-08-15", "/new"));
+
+				later.content = [{ type: "text", text: "later image" }, image];
+				invalidateMessageCache(later);
+				const withImage = steeringRequest(injector, history, "2026-08-15", "/new");
+				expect(withImage[1]!.content).toContainEqual(image);
+				expect(stripImagesFromMessage(later)).toBe(1);
+				const strippedLater = steeringRequest(injector, history, "2026-08-15", "/new");
+				expect(JSON.stringify(strippedLater.slice(0, 1))).toBe(rootBytes);
+				expect(strippedLater[1]!.content).not.toContainEqual(image);
+				expect(reminderText(strippedLater[1]!)).toContain("later image");
+				expect(reminderText(strippedLater[1]!)).toContain(renderDateCwdReminder("2026-08-15", "/new"));
+				expect(steeringRequest(injector, history, "2026-08-15", "/new")).toEqual(strippedLater);
+			});
+
+			it("restores reminders after side requests and tail trimming without growing on replay", () => {
+				const injector = new DateCwdReminderInjector();
+				const root = steeringMessage(kind, "main history");
+				const history: AgentMessage[] = [root, createAssistantMessage("done")];
+				const first = steeringRequest(injector, history, "2026-08-14", "/old");
+				const firstBytes = JSON.stringify(first);
+				const sideHistory: AgentMessage[] = [...history, { role: "user", content: "temporary", timestamp: 2 }];
+				const side = steeringRequest(injector, sideHistory, "2026-08-15", "/new");
+				expect(JSON.stringify(side.slice(0, 2))).toBe(firstBytes);
+				expect(reminderText(side[2]!)).toBe(`${renderDateCwdReminder("2026-08-15", "/new")}\n\ntemporary`);
+				const main = steeringRequest(injector, history, "2026-08-15", "/new");
+				expect(JSON.stringify(main.slice(0, 2))).toBe(firstBytes);
+				expect(main[2]).toMatchObject({ role: "developer", content: renderDateCwdReminder("2026-08-15", "/new") });
+				for (let replay = 0; replay < 3; replay++) {
+					expect(steeringRequest(injector, sideHistory, "2026-08-15", "/new")).toEqual([...main, side[2]!]);
+					expect(steeringRequest(injector, history, "2026-08-15", "/new")).toEqual(main);
+				}
+
+				// Removing the developer control's anchor must recover too, not just
+				// removing an injected user carrier as the side request did above.
+				const trimmed = steeringRequest(injector, [root], "2026-08-15", "/new");
+				expect(trimmed[0]).toBe(first[0]);
+				expect(trimmed[1]).toMatchObject({
+					role: "developer",
+					content: renderDateCwdReminder("2026-08-15", "/new"),
+				});
+				expect(steeringRequest(injector, [root], "2026-08-15", "/new")).toEqual(trimmed);
+				expect(steeringRequest(injector, history, "2026-08-15", "/new")).toEqual([...trimmed, first[1]!, main[2]!]);
+			});
+		});
+	}
+
+	it("isolates injectors and resets when an equal-content root is replaced", () => {
+		const one = new DateCwdReminderInjector();
+		const two = new DateCwdReminderInjector();
+		const root = steeringMessage("user", "same content");
+		const first = steeringRequest(one, [root], "2026-08-14", "/one");
+		const other = steeringRequest(two, [root], "2026-08-15", "/two");
+		expect(reminderText(other[0]!)).toContain(renderDateCwdReminder("2026-08-15", "/two"));
+		expect(reminderText(other[0]!)).not.toContain(renderDateCwdReminder("2026-08-14", "/one"));
+		expect(steeringRequest(one, [root], "2026-08-14", "/one")[0]).toBe(first[0]);
+		const replacement = steeringMessage("user", "same content");
+		const replaced = steeringRequest(one, [replacement], "2026-08-15", "/new");
+		expect(replaced).toHaveLength(1);
+		expect(reminderText(replaced[0]!)).toContain(renderDateCwdReminder("2026-08-15", "/new"));
+		expect(reminderText(replaced[0]!)).not.toContain(renderDateCwdReminder("2026-08-14", "/one"));
+		expect(steeringRequest(one, [replacement], "2026-08-15", "/new")[0]).toBe(replaced[0]);
+		expect(steeringRequest(two, [root], "2026-08-15", "/two")[0]).toBe(other[0]);
 	});
 });
 

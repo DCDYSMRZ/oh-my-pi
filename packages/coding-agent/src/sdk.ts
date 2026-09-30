@@ -1283,7 +1283,7 @@ const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
 /** Matches the truncation applied to per-server instructions inside `rebuildSystemPrompt`. */
 const MAX_MCP_INSTRUCTIONS_LENGTH = 4000;
 /** Built-ins `createTools` force-includes into explicit tool lists; the active set mirrors them. */
-const SESSION_MANAGED_BUILTIN_TOOL_NAMES = ["manage_skill", "learn", "context_notes", "new_context"];
+const SESSION_MANAGED_BUILTIN_TOOL_NAMES = ["manage_skill", "learn", "context_notes", "new_context", "goal"];
 
 let sshCleanupRegistered = false;
 
@@ -3323,15 +3323,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		for (const [name, tool] of toolRegistry) {
 			nativeToolsByName.set(name, tool);
 		}
-		if (!restrictToolNames && !toolRegistry.has("goal") && cfgGoalEnabled.get(settings)) {
-			const goalTool = await logger.time("createTools:goal:session", HIDDEN_TOOLS.goal, toolSession);
-			if (goalTool) {
-				const wrapped = wrapToolWithMetaNotice(goalTool);
-				toolRegistry.set(goalTool.name, wrapped);
-				builtInRegistryToolNames.add(goalTool.name);
-				nativeToolsByName.set(goalTool.name, wrapped);
-			}
-		}
 		for (const tool of wrappedExtensionTools) {
 			toolRegistry.set(tool.name, tool);
 			builtInRegistryToolNames.delete(tool.name);
@@ -3445,13 +3436,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			return writeRegistration;
 		};
 
-		// Goal mode can be enabled after the session was created (settings UI,
-		// `/set goal.enabled true`). The eager registration above only runs at
-		// creation, so a runtime enable would leave the registry without `goal`
-		// and `#enterGoalMode`'s `setActiveToolsByName([...tools, "goal"])` would
-		// silently drop the unknown name — goal mode starts, the model is told to
-		// use the `goal` tool, and the call fails (issue #9444). Register it
-		// lazily on demand, mirroring `ensureWriteRegistered`.
+		// Retain lazy registration for an explicit selection after Goal capability
+		// is enabled at runtime. Mode transitions themselves never select tools.
 		let goalRegistration: Promise<boolean> | undefined;
 		const ensureGoalRegistered = (): Promise<boolean> => {
 			if (toolRegistry.has("goal")) return Promise.resolve(true);
@@ -3511,7 +3497,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					continue;
 				}
 				if (!planned.has(name) || (registered && (isBuiltIn(name) || nativeToolsByName.has(name)))) continue;
-				const tool = await logger.time(`createTools:${name}:settings`, BUILTIN_TOOLS[name], toolSession);
+				const factory = name === "goal" ? HIDDEN_TOOLS.goal : BUILTIN_TOOLS[name];
+				const tool = await logger.time(`createTools:${name}:settings`, factory, toolSession);
 				if (!tool) continue;
 				const native = wrapToolWithMetaNotice(tool);
 				nativeToolsByName.set(name, native);
@@ -3924,7 +3911,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return tool?.defaultInactive === true || tool?.hidden === true;
 			}),
 		);
-		const requestedActiveToolNames = normalizedRequested.filter(name => name !== "goal");
 		const explicitlyRequestedToolNameSet = explicitlyRequestedToolNames
 			? new Set(explicitlyRequestedToolNames)
 			: undefined;
@@ -3937,8 +3923,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				explicitlyRequestedToolNameSet.has("write") ||
 				toolSession.deviceOnlyWrite === true);
 		const initialRequestedActiveToolNames = options.toolNames
-			? requestedActiveToolNames
-			: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name));
+			? normalizedRequested
+			: normalizedRequested.filter(name => !defaultInactiveToolNames.has(name));
 		let initialToolNames = [...initialRequestedActiveToolNames];
 
 		// Custom tools and extension-registered tools are always included
