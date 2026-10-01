@@ -37,6 +37,7 @@ import {
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
 	EventLoopKeepalive,
+	filterProviderReplayMessages,
 	type QueuedMessagePreparation,
 	resolveTelemetry,
 	type StreamFn,
@@ -2198,7 +2199,8 @@ export class AgentSession implements SettingsScope {
 			},
 			obfuscateTextForProvider: text => this.#obfuscateTextForProvider(text),
 			deobfuscateFromProvider: text => this.#deobfuscateFromProvider(text),
-			convertMessagesToLlm: (messages, signal) => this.convertMessagesToLlm(messages, signal),
+			buildSideRequestContext: (messages, systemPrompt, signal) =>
+				this.buildSideRequestContext(messages, systemPrompt, signal),
 			prepareSimpleStreamOptions: (options, provider) => this.prepareSimpleStreamOptions(options, provider),
 			effectiveServiceTier: model => this.#models.effectiveServiceTier(model),
 		};
@@ -6342,6 +6344,17 @@ export class AgentSession implements SettingsScope {
 		return await this.#providerBoundary.convertMessagesToLlm(messages, signal);
 	}
 
+	/** Build a side request from stable converted history before provider-only transforms. */
+	async buildSideRequestContext(
+		messages: AgentMessage[],
+		systemPrompt?: string[],
+		signal?: AbortSignal,
+	): Promise<Context> {
+		const transformedMessages = await this.#transformContext(messages, signal);
+		const llmMessages = filterProviderReplayMessages(convertToLlm(transformedMessages));
+		return await this.agent.buildSideRequestContext(llmMessages, systemPrompt);
+	}
+
 	/** Apply session-level stream hooks to a direct side request. */
 	prepareSimpleStreamOptions(options: SimpleStreamOptions, provider = "anthropic"): SimpleStreamOptions {
 		return this.#providerBoundary.prepareSimpleStreamOptions(options, provider);
@@ -10443,9 +10456,8 @@ export class AgentSession implements SettingsScope {
 		assertEphemeralTurnReady();
 		const cacheSessionId = this.sessionId;
 		const snapshot = this.#buildEphemeralSnapshot(args.promptText, args.history);
-		const llmMessages = await this.convertMessagesToLlm(snapshot, args.signal);
+		const sideContext = await this.buildSideRequestContext(snapshot, undefined, args.signal);
 		assertEphemeralTurnReady();
-		const sideContext = await this.agent.buildSideRequestContext(llmMessages);
 		const toolHistory = sideContext.messages.some(
 			message =>
 				message.role === "toolResult" ||

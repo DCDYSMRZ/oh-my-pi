@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept steering wrappers and date/cwd reminders stable through native replay, image normalization, and independent side/advisor histories, while preserving opaque payloads and honoring source-message edits ([#13880](https://github.com/can1357/oh-my-pi/pull/13880) by [@DCDYSMRZ](https://github.com/DCDYSMRZ)).
+- Kept the Goal capability declared across goal lifecycle transitions; disabling it pauses execution, and Goal entry points respect the session's selected tools and active modes ([#13880](https://github.com/can1357/oh-my-pi/pull/13880) by [@DCDYSMRZ](https://github.com/DCDYSMRZ)).
+
 ## [18.4.6] - 2026-10-01
 
 ### Added
@@ -24,8 +29,6 @@
 
 ### Fixed
 
-- Kept steering message wrappers and date/cwd reminders stable across provider requests, while recovering the current reminder after side requests or history trimming and honoring message edits ([#13880](https://github.com/can1357/oh-my-pi/pull/13880) by [@DCDYSMRZ](https://github.com/DCDYSMRZ)).
-- Kept the Goal capability declared across goal lifecycle transitions; disabling it pauses execution, and Goal entry points respect the session's selected tools and active modes ([#13880](https://github.com/can1357/oh-my-pi/pull/13880) by [@DCDYSMRZ](https://github.com/DCDYSMRZ)).
 - Fixed Tern commands issued while the agent is working so they appear immediately in the transcript instead of being clipped above the prompt.
 - Added a dismiss action for Tern's prompt-area error notifications.
 - Fixed dollar signs in prompts being mistaken for Python mode until a following space confirms the mode.

@@ -4014,25 +4014,23 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// one mid-session — historical image blocks would otherwise be replayed to
 		// a provider that 400s on them (#5400). Read both dynamically so a `/model`
 		// switch or setting change takes effect on the next turn.
-		const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
-			const converted = convertToLlm(messages);
+		const blockProviderImages = (messages: Message[], activeModel: Model | undefined): Message[] => {
 			if (cfgImagesBlockImages.get(settings)) {
-				return replaceLlmImagesWithText(converted, "Image reading is disabled.");
+				return replaceLlmImagesWithText(messages, "Image reading is disabled.");
 			}
-			const activeModel = agent?.state.model ?? model;
 			if (activeModel && !activeModel.input.includes("image")) {
-				return replaceLlmImagesWithText(
-					converted,
-					"[image omitted: the active model does not support image input]",
-				);
+				return replaceLlmImagesWithText(messages, "[image omitted: the active model does not support image input]");
 			}
-			return converted;
+			return messages;
 		};
 
-		// Final convertToLlm: live provider replay drops API-level refusal errors,
-		// then applies secret obfuscation to the remaining outbound context.
+		// Keep stable converted message identities until reminder ownership is recorded.
+		const convertToLlmStable = (messages: AgentMessage[]): Message[] =>
+			filterProviderReplayMessages(convertToLlm(messages));
+		// Session side-request consumers also use this converter without the provider
+		// transform, so retain their outbound image blocking and secret redaction.
 		const convertToLlmFinal = (messages: AgentMessage[]): Message[] => {
-			const converted = filterProviderReplayMessages(convertToLlmWithBlockImages(messages));
+			const converted = blockProviderImages(convertToLlmStable(messages), agent?.state.model ?? model);
 			if (!obfuscator?.hasSecrets()) return converted;
 			return obfuscateMessages(obfuscator, converted);
 		};
@@ -4078,7 +4076,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			blobBroker,
 		);
 		const transformProviderContext = async (context: Context, transformModel: Model): Promise<Context> => {
-			let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
+			// Record ownership before image blocking, redaction, or normalization clone
+			// messages. Volatility stays out of the tool-schema prefix cache (#7404).
+			let transformed = dateCwdReminder.transform(
+				context,
+				formatLocalCalendarDate(),
+				normalizePromptPath(sessionManager.getCwd()),
+			);
+			const messages = blockProviderImages(transformed.messages, transformModel);
+			if (messages !== transformed.messages) transformed = { ...transformed, messages };
+			transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 			transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);
 			transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
@@ -4087,14 +4094,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// else, and it runs before the blob broker uploads any of these bytes.
 			transformed = await dropUnreadableContextImages(transformed, transformModel);
 			transformed = await blobBroker.decorateContext(transformed, transformModel);
-			// Keep per-request volatility out of the system prompt: the date/cwd
-			// reminder rides on the first user turn so open-weight providers keep
-			// their tool-schema prefix cache (#7404).
-			return dateCwdReminder.transform(
-				transformed,
-				formatLocalCalendarDate(),
-				normalizePromptPath(sessionManager.getCwd()),
-			);
+			return transformed;
 		};
 		const onPayload = async (payload: unknown, model?: Model, signal?: AbortSignal) => {
 			return await extensionRunner.emitBeforeProviderRequest(payload, model, signal);
@@ -4219,7 +4219,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// namespace/project discovery on the original repo's git remote. Re-read it
 			// per turn from the SessionManager.
 			cwdResolver: () => sessionManager.getCwd(),
-			convertToLlm: convertToLlmFinal,
+			convertToLlm: convertToLlmStable,
 			onPayload,
 			onResponse,
 			sessionId: providerSessionId,
@@ -5009,19 +5009,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					...captureOptions,
 					cwd: sessionManager.getCwd(),
 					cwdResolver: () => sessionManager.getCwd(),
-					convertToLlm: convertToLlmFinal,
+					convertToLlm: convertToLlmStable,
 					transformContext: async messages => wrapSteeringForModel(messages),
 					transformProviderContext: async (context, transformModel) => {
-						let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
+						let transformed = captureDateCwdReminder.transform(
+							context,
+							formatLocalCalendarDate(),
+							normalizePromptPath(sessionManager.getCwd()),
+						);
+						const messages = blockProviderImages(transformed.messages, transformModel);
+						if (messages !== transformed.messages) transformed = { ...transformed, messages };
+						transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 						transformed = clampProviderContextImages(transformed, transformModel);
 						transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
 						transformed = await dropUnreadableContextImages(transformed, transformModel);
 						transformed = await blobBroker.decorateContext(transformed, transformModel);
-						return captureDateCwdReminder.transform(
-							transformed,
-							formatLocalCalendarDate(),
-							normalizePromptPath(sessionManager.getCwd()),
-						);
+						return transformed;
 					},
 					temperature: agent.temperature,
 					topP: agent.topP,

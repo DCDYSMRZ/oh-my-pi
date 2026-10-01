@@ -3,11 +3,17 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
 import type { Api, Context, Message, Model, ModelSpec, UserMessage } from "@oh-my-pi/pi-ai";
 import { clearCustomApis, registerCustomApi } from "@oh-my-pi/pi-ai";
+import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { streamOllama } from "@oh-my-pi/pi-ai/providers/ollama";
+import { buildTransformedCodexRequestBody } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { createOpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai/utils";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { DateCwdReminderInjector, renderDateCwdReminder } from "@oh-my-pi/pi-coding-agent/session/date-cwd-reminder";
 import { convertToLlm, stripImagesFromMessage, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -16,7 +22,7 @@ import { formatLocalCalendarDate } from "@oh-my-pi/pi-tui/chrome/local-date";
 import { normalizePromptPath } from "@oh-my-pi/pi-coding-agent/utils/prompt-path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
-import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 describe("date-cwd-reminder", () => {
 	afterEach(() => {
@@ -372,4 +378,367 @@ describe("date-cwd reminder on the provider wire", () => {
 			authStorage.close();
 		}
 	});
+});
+
+describe("date/cwd reminders with native replay", () => {
+	const date = "2026-08-14";
+	const cwd = "/work/native-replay";
+	const reminder = renderDateCwdReminder(date, cwd);
+
+	for (const provider of ["codex", "anthropic"] as const) {
+		for (const hasLaterUser of [false, true]) {
+			it(`${provider} preserves native history and delivers the initial reminder${hasLaterUser ? " with an existing follow-up" : " without a plain user carrier"}`, async () => {
+				const injector = new DateCwdReminderInjector();
+				const nativeItems = [
+					{ type: "message", role: "user", content: [{ type: "input_text", text: "Preserved user" }] },
+					{ type: "compaction", encrypted_content: "enc_123" },
+				];
+				const summary = "## Goal\nAudit the handlers.\n\n## Next Steps\nContinue with chunk 11.";
+				const native: UserMessage = {
+					role: "user",
+					content: `<summary>${summary}</summary>`,
+					providerPayload:
+						provider === "codex"
+							? createOpenAIResponsesHistoryPayload("openai-codex", nativeItems, false)
+							: {
+									type: "anthropicCompaction",
+									provider: "anthropic",
+									content: summary,
+									signature: "sig_opaque_on_demand",
+									filesText: "<files>handlers.ts (Read)</files>",
+								},
+					timestamp: 1,
+				};
+				const codex = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.5");
+				const anthropic = getBundledModel<"anthropic-messages">("anthropic", "claude-fable-5");
+				const history: Message[] = [native];
+				if (provider === "anthropic") {
+					history.push(
+						{
+							...createAssistantMessage("Retained answer."),
+							model: anthropic.id,
+							content: [
+								{ type: "thinking", thinking: "Keep this reasoning.", thinkingSignature: "sig_kept" },
+								{ type: "text", text: "Retained answer." },
+								{ type: "toolCall", id: "read_1", name: "read", arguments: { path: "handlers.ts" } },
+							],
+							stopReason: "toolUse",
+							timestamp: 2,
+						},
+						{
+							role: "toolResult",
+							toolCallId: "read_1",
+							toolName: "read",
+							content: [{ type: "text", text: "retained file contents" }],
+							isError: false,
+							timestamp: 3,
+						},
+					);
+				}
+				if (hasLaterUser) history.push({ role: "user", content: "Existing follow-up", timestamp: 4 });
+
+				async function request() {
+					const before = JSON.stringify(history);
+					const context = injector.transform({ systemPrompt: ["system"], messages: history }, date, cwd);
+					let wire: unknown;
+					if (provider === "codex") {
+						const body = await buildTransformedCodexRequestBody(codex, context, { responsesLite: false });
+						wire = JSON.parse(JSON.stringify(body.input));
+					} else {
+						await streamAnthropic(anthropic, context, {
+							apiKey: "sk-ant-test",
+							thinkingEnabled: true,
+							client: {
+								...(anthropic.baseUrl ? { baseURL: anthropic.baseUrl } : {}),
+								messages: {
+									create: value => {
+										wire = JSON.parse(JSON.stringify(value.messages));
+										throw new Error("request captured");
+									},
+								},
+							},
+						}).result();
+					}
+					expect(JSON.stringify(history)).toBe(before);
+					if (!Array.isArray(wire)) throw new Error("Expected serialized provider messages");
+					expect(JSON.stringify(wire).split(JSON.stringify(reminder).slice(1, -1))).toHaveLength(2);
+					if (provider === "codex") {
+						expect(wire.slice(0, nativeItems.length)).toEqual(nativeItems);
+					} else {
+						expect(wire[0]).toMatchObject({
+							role: "assistant",
+							content: [
+								{ type: "compaction", content: summary, signature: "sig_opaque_on_demand" },
+								{ type: "thinking", thinking: "Keep this reasoning.", signature: "sig_kept" },
+								{ type: "text", text: "Retained answer." },
+								{ type: "tool_use", id: "read_1", name: "read", input: { path: "handlers.ts" } },
+							],
+						});
+						expect(wire[1].role).toBe("user");
+						const toolResults = wire[1].content as Array<{ type: string; tool_use_id?: string }>;
+						expect(
+							toolResults.some(block => block.type === "tool_result" && block.tool_use_id === "read_1"),
+						).toBe(true);
+						expect(JSON.stringify(wire[1])).toContain("retained file contents");
+						expect(JSON.stringify(wire)).toContain("<files>handlers.ts (Read)</files>");
+					}
+					return wire;
+				}
+
+				const first = await request();
+				expect(await request()).toEqual(first);
+				history.push({ role: "user", content: "Appended follow-up", timestamp: 5 });
+				const appended = await request();
+				expect(JSON.stringify(appended)).toContain("Appended follow-up");
+				expect(await request()).toEqual(appended);
+			});
+		}
+	}
+});
+
+describe("SDK date/cwd history through image normalization", () => {
+	for (const anchor of ["first WebP", "later WebP", "toolResult WebP", "text control"] as const) {
+		it(`preserves the serialized A-B-A prefix for ${anchor}`, async () => {
+			using tempDir = TempDir.createSync("@pi-date-cwd-images-");
+			const model = buildModel({
+				id: "reminder-vision",
+				name: "Reminder vision",
+				api: "ollama-chat",
+				provider: "ollama-cloud",
+				baseUrl: "https://ollama.com",
+				reasoning: false,
+				input: ["text", "image"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 1024,
+			});
+			// Same valid image seed as image-webp-exclusion.test.ts.
+			const seed = Buffer.from(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+				"base64",
+			);
+			const image = {
+				type: "image" as const,
+				data: Buffer.from(await new Bun.Image(seed).resize(200, 200).webp({ quality: 90 }).bytes()).toBase64(),
+				mimeType: "image/webp",
+			};
+			const root: UserMessage = {
+				role: "user",
+				content: anchor === "first WebP" ? [{ type: "text", text: "first" }, image] : "first",
+				timestamp: 1,
+			};
+			const history: Message[] = [root];
+			if (anchor === "toolResult WebP") {
+				history.push(
+					{
+						...createAssistantMessage(""),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						content: [{ type: "toolCall", id: "read_1", name: "read", arguments: { path: "image.webp" } }],
+						stopReason: "toolUse",
+						timestamp: 2,
+					},
+					{
+						role: "toolResult",
+						toolCallId: "read_1",
+						toolName: "read",
+						content: [image],
+						isError: false,
+						timestamp: 3,
+					},
+				);
+			}
+			const authStorage = createInMemoryAuthStorage();
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const { session } = await createAgentSession({
+				cwd: tempDir.path(),
+				agentDir: tempDir.path(),
+				sessionManager,
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				model,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				taskDepth: 1,
+				agentId: "SubAgent",
+			});
+			try {
+				async function request(cwd: string, requestHistory: Message[] = history) {
+					sessionManager.setCwdWithoutRelocation(cwd);
+					const sourceBytes = JSON.stringify(requestHistory);
+					// Exercise the SDK-installed chain, not a hand-written ordering of transforms.
+					const context = await session.buildSideRequestContext(requestHistory, ["system"]);
+					for (const message of context.messages) {
+						if (typeof message.content === "string") continue;
+						for (const part of message.content) {
+							if (part.type === "image") expect(part.mimeType).not.toBe("image/webp");
+						}
+					}
+					let wire: Array<{ role: string; content: string; images?: string[] }> | undefined;
+					await streamOllama(model, context, {
+						apiKey: "test-key",
+						fetch: async (_input, init) => {
+							wire = JSON.parse(String(init?.body)).messages;
+							return new Response(
+								'{"message":{"content":"ok"},"done":true,"prompt_eval_count":1,"eval_count":1}\n',
+							);
+						},
+					}).result();
+					expect(JSON.stringify(requestHistory)).toBe(sourceBytes);
+					if (!wire) throw new Error("Expected Ollama request");
+					return wire;
+				}
+
+				const cwdA = tempDir.path();
+				const cwdB = tempDir.join("moved");
+				const first = await request(cwdA);
+				const firstBytes = JSON.stringify(first);
+				expect(first.find(message => message.role === "user")?.content).toContain(normalizePromptPath(cwdA));
+				expect(await request(cwdA)).toEqual(first);
+				let detached: { history: Message[]; bytes: string } | undefined;
+				if (anchor === "text control") {
+					// A public side request may use a distinct root with identical content.
+					// It must neither inherit A nor discard the main history's ownership.
+					const sideHistory: Message[] = [structuredClone(root)];
+					const side = await request(cwdB, sideHistory);
+					const sideUser = side.find(message => message.role === "user");
+					expect(sideUser?.content).toContain(`current working directory: '${normalizePromptPath(cwdB)}'`);
+					expect(sideUser?.content).not.toContain(`current working directory: '${normalizePromptPath(cwdA)}'`);
+					detached = { history: sideHistory, bytes: JSON.stringify(side) };
+				}
+				if (anchor === "later WebP") {
+					history.push({ role: "user", content: [{ type: "text", text: "later" }, image], timestamp: 4 });
+				}
+				const changed = await request(cwdB);
+				expect(JSON.stringify(changed.slice(0, first.length))).toBe(firstBytes);
+				expect(changed.at(-1)?.content).toContain(normalizePromptPath(cwdB));
+				const changedBytes = JSON.stringify(changed);
+				expect(await request(cwdB)).toEqual(changed);
+				if (detached) {
+					expect(JSON.stringify(await request(cwdB, detached.history))).toBe(detached.bytes);
+				}
+				const back = await request(cwdA);
+				expect(JSON.stringify(back.slice(0, changed.length))).toBe(changedBytes);
+				expect(back.at(-1)?.content).toContain(normalizePromptPath(cwdA));
+				expect(await request(cwdA)).toEqual(back);
+				if (anchor !== "text control") {
+					const images = back.flatMap(message => message.images ?? []);
+					expect(images).toHaveLength(1);
+					expect(Buffer.from(images[0]!, "base64").subarray(8, 12).toString()).not.toBe("WEBP");
+				}
+			} finally {
+				await session.dispose();
+				authStorage.close();
+			}
+		});
+	}
+});
+
+describe("SDK reminder stability with secret redaction", () => {
+	for (const consumer of ["side", "advisor"] as const) {
+		it(`keeps ${consumer} requests redacted without rewriting the historical reminder`, async () => {
+			using tempDir = TempDir.createSync("@pi-date-cwd-secrets-");
+			const secret = "REMINDER_PRIVATE_TOKEN_12345";
+			await Bun.write(tempDir.join(".omp/secrets.yml"), `- type: plain\n  content: ${secret}\n`);
+			const requests: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(request) {
+					requests.push((await request.json()) as (typeof requests)[number]);
+					return new Response('{"message":{"content":"ok"},"done":true,"prompt_eval_count":1,"eval_count":1}\n');
+				},
+			});
+			const authStorage = createInMemoryAuthStorage();
+			const model = buildModel({
+				id: "reminder-secrets",
+				name: "Reminder secrets",
+				api: "ollama-chat",
+				provider: "ollama-cloud",
+				baseUrl: server.url.href,
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 1024,
+			});
+			authStorage.keys.setRuntime(model.provider, "test-key");
+			authStorage.keys.setRuntime("anthropic", "test-key");
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			let session: AgentSession | undefined;
+			try {
+				({ session } = await createAgentSession({
+					cwd: tempDir.path(),
+					agentDir: tempDir.join("agent"),
+					sessionManager,
+					authStorage,
+					modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
+					settings: Settings.isolated({ "compaction.enabled": false, "secrets.enabled": true }),
+					model,
+					toolNames: [],
+					disableExtensionDiscovery: true,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+					skipPythonPreflight: true,
+					taskDepth: 1,
+					agentId: "SubAgent",
+				}));
+				const cwdA = normalizePromptPath(tempDir.path());
+				const cwdB = normalizePromptPath(tempDir.join("moved"));
+				let agent = session.agent;
+				if (consumer === "advisor") {
+					session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+					expect(session.setAdvisorEnabled(true)).toBe(true);
+					const advisor = session.getAdvisorAgent();
+					if (!advisor) throw new Error("Expected live advisor");
+					advisor.setModel(model);
+					agent = advisor;
+				}
+				await agent.prompt(`Historical question ${secret}`);
+				expect(requests).toHaveLength(1);
+				const first = requests[0]!.messages;
+				const firstBytes = JSON.stringify(first);
+				expect(first.find(message => message.role === "user")?.content).toContain(cwdA);
+				sessionManager.setCwdWithoutRelocation(tempDir.join("moved"));
+				if (consumer === "side") {
+					const messageCountBeforeSide = session.messages.length;
+					await session.runEphemeralTurn({ promptText: `Temporary side question ${secret}` });
+					expect(session.messages).toHaveLength(messageCountBeforeSide);
+					expect(JSON.stringify(session.messages)).not.toContain("Temporary side question");
+					expect(requests).toHaveLength(2);
+					expect(JSON.stringify(requests[1]!.messages.slice(0, first.length))).toBe(firstBytes);
+					expect(requests[1]!.messages.at(-1)?.content).toContain(cwdB);
+				}
+				await agent.prompt(`Follow-up question ${secret}`);
+				expect(requests).toHaveLength(consumer === "side" ? 3 : 2);
+				const resumed = requests.at(-1)!.messages;
+				expect(JSON.stringify(resumed.slice(0, first.length))).toBe(firstBytes);
+				expect(resumed.at(-1)?.content).toContain(cwdB);
+				expect(JSON.stringify(resumed)).not.toContain("Temporary side question");
+				const placeholder = session.obfuscator?.obfuscate(secret);
+				if (!placeholder || placeholder === secret) throw new Error("Expected configured secret obfuscation");
+				for (const request of requests) {
+					expect(JSON.stringify(request)).not.toContain(secret);
+					expect(JSON.stringify(request.messages)).toContain(placeholder);
+				}
+				expect(JSON.stringify(agent.state.messages)).toContain(secret);
+			} finally {
+				await session?.dispose();
+				authStorage.close();
+				await server.stop(true);
+			}
+		});
+	}
 });
